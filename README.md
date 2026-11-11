@@ -4,7 +4,7 @@ AWS 安全服务的一次性开通/配置脚本。每个脚本都可重复运行
 
 | 目录 | 内容 |
 |---|---|
-| [guardduty/](guardduty/) | 所有区域开通 GuardDuty 基础检测，可选组织委派，告警汇总到一个 SNS |
+| [guardduty/](guardduty/) | 所有区域批量开通 GuardDuty、批量委派给安全账号 |
 
 ## 前提
 
