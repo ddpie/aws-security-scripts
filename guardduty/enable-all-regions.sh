@@ -11,12 +11,13 @@
 #   --enable                没开 GuardDuty 的区域新建 detector；已开的区域不动
 #   --delegate <账号ID>     把 GuardDuty 委派给这个账号；已委派给它的区域跳过，委派给别人的区域不覆盖
 #   --features base|default 新建 detector 的保护功能：base=只开基础检测、付费功能全关（默认）；default=AWS 默认
+#   --with <F1,F2>          配合 base：这些付费功能开启，其余仍关闭（如 LAMBDA_NETWORK_LOGS,EKS_AUDIT_LOGS）
 #   --regions <a,b,...>     只处理这些区域（默认：所有已启用区域）
 #   --dry-run               只打印要做什么，不做修改
 #   --yes                   跳过确认
 set -uo pipefail
 
-PROFILE=""; ENABLE=0; DELEGATE=""; FEATURES=base; ONLY=""; DRY=0; YES=0
+PROFILE=""; ENABLE=0; DELEGATE=""; FEATURES=base; WITH=""; ONLY=""; DRY=0; YES=0
 PAID=(S3_DATA_EVENTS EKS_AUDIT_LOGS EBS_MALWARE_PROTECTION RDS_LOGIN_EVENTS LAMBDA_NETWORK_LOGS RUNTIME_MONITORING AI_PROTECTION)
 
 die() { echo "错误: $*" >&2; exit 1; }
@@ -27,10 +28,11 @@ while [[ $# -gt 0 ]]; do
     --enable)   ENABLE=1; shift;;
     --delegate) val "$@"; DELEGATE=$2; shift 2;;
     --features) val "$@"; FEATURES=$2; shift 2;;
+    --with)     val "$@"; WITH=$2; shift 2;;
     --regions)  val "$@"; ONLY=$2; shift 2;;
     --dry-run)  DRY=1; shift;;
     --yes)      YES=1; shift;;
-    -h|--help)  sed -n '2,16p' "$0"; exit 0;;
+    -h|--help)  sed -n '2,17p' "$0"; exit 0;;
     *) die "未知参数 $1";;
   esac
 done
@@ -38,6 +40,10 @@ done
 [[ $ENABLE == 1 || -n $DELEGATE ]] || die "至少要用 --enable 或 --delegate 其中一个"
 [[ -z $DELEGATE || $DELEGATE =~ ^[0-9]{12}$ ]] || die "--delegate 必须是 12 位账号 ID"
 [[ $FEATURES == base || $FEATURES == default ]] || die "--features 只能是 base 或 default"
+IFS=, read -ra ON <<<"${WITH// /}"
+[[ ${#ON[@]} -eq 0 || $FEATURES == base ]] || die "--with 只能配合 --features base"
+for f in "${ON[@]}"; do [[ " ${PAID[*]} " == *" $f "* ]] || die "--with 不认识的功能: ${f}（可选: ${PAID[*]}）"; done
+status_of() { [[ " ${ON[*]} " == *" $1 "* ]] && echo ENABLED || echo DISABLED; }
 
 command -v aws >/dev/null || die "没找到 aws 命令，请先安装 AWS CLI v2"
 gd() { aws --profile "$PROFILE" guardduty "$@"; }
@@ -64,7 +70,7 @@ done
 
 # ---------- 预检：只读 ----------
 echo "账号: ${ME}   区域(${#REGIONS[@]}个): ${REGIONS[*]}"
-[[ $ENABLE == 1 ]] && echo "开通: 是（新建 detector 的保护功能: ${FEATURES}）"
+[[ $ENABLE == 1 ]] && echo "开通: 是（新建 detector 的保护功能: ${FEATURES}${WITH:+，另开 ${WITH}}）"
 [[ -n $DELEGATE ]] && echo "委派给: ${DELEGATE}"
 echo
 for R in "${REGIONS[@]}"; do
@@ -95,7 +101,7 @@ if [[ $YES == 0 ]]; then
 fi
 
 # ---------- 执行 ----------
-OFF=(); for f in "${PAID[@]}"; do OFF+=("Name=${f},Status=DISABLED"); done
+OFF=(); for f in "${PAID[@]}"; do OFF+=("Name=${f},Status=$(status_of "$f")"); done
 FAILED=(); OTHER=()
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 lasterr() { grep -v '^[[:space:]]*$' "$ERR" | tail -n1; }   # AWS CLI 报错末尾有空行
@@ -106,7 +112,7 @@ for R in "${REGIONS[@]}"; do
     if [[ $det == None ]]; then
       args=(create-detector --region "$R" --enable --finding-publishing-frequency FIFTEEN_MINUTES)
       if [[ $FEATURES == base ]] && gd "${args[@]}" --features "${OFF[@]}" >/dev/null 2>"$ERR"; then
-        echo "  ${R}: 已开通（只开基础检测）"
+        echo "  ${R}: 已开通（基础检测${WITH:+ + ${WITH}}）"
       elif [[ $FEATURES == base ]]; then
         # 一次性关闭失败（多半是该区域不支持某项功能）：先按默认建，再逐项关
         echo "  ${R}: 建时关闭付费功能失败，改为建好后逐项关闭。原因: $(lasterr)"
@@ -116,7 +122,7 @@ for R in "${REGIONS[@]}"; do
             done_f=0
             for try in 1 2 3; do
               gd update-detector --region "$R" --detector-id "$det" \
-                --features "Name=${f},Status=DISABLED" >/dev/null 2>"$ERR" && { done_f=1; break; }
+                --features "Name=${f},Status=$(status_of "$f")" >/dev/null 2>"$ERR" && { done_f=1; break; }
               sleep 5
             done
             if [[ $done_f == 0 ]]; then
@@ -124,7 +130,7 @@ for R in "${REGIONS[@]}"; do
               if grep -qiE 'not supported|not available|invalid.*feature' "$ERR"; then
                 echo "  ${R}: ${f} 该区域不支持，跳过"
               else
-                echo "  ${R}: 关闭 ${f} 失败: $(lasterr)"; ok=0
+                echo "  ${R}: 设置 ${f} 失败: $(lasterr)"; ok=0
               fi
             fi
           done

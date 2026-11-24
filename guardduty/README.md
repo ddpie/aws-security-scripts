@@ -21,6 +21,7 @@ GuardDuty 是区域级服务，开通和委派都要每个区域单独做。这�
 | `--enable` | 没开 GuardDuty 的区域新建 detector；已开的区域不动 |
 | `--delegate <账号ID>` | 委派给这个账号；已委派给它的跳过，已委派给别人的不覆盖 |
 | `--features base\|default` | 配合 `--enable`：新建 detector 的保护功能。`base`（默认）只开基础检测，付费功能全关；`default` 用 AWS 默认 |
+| `--with F1,F2` | 配合 `base`：列出的付费功能开启，其余关闭。例：`--with LAMBDA_NETWORK_LOGS,EKS_AUDIT_LOGS` 只开 Lambda Protection 和 EKS 审计日志 |
 | `--regions a,b` | 只处理这些区域，默认所有已启用区域 |
 | `--dry-run` | 只打印要做什么 |
 | `--yes` | 跳过确认 |
