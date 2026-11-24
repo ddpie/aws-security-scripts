@@ -42,8 +42,12 @@ done
 [[ $FEATURES == base || $FEATURES == default ]] || die "--features 只能是 base 或 default"
 IFS=, read -ra ON <<<"${WITH// /}"
 [[ ${#ON[@]} -eq 0 || $FEATURES == base ]] || die "--with 只能配合 --features base"
-for f in "${ON[@]}"; do [[ " ${PAID[*]} " == *" $f "* ]] || die "--with 不认识的功能: ${f}（可选: ${PAID[*]}）"; done
-status_of() { [[ " ${ON[*]} " == *" $1 "* ]] && echo ENABLED || echo DISABLED; }
+if [[ ${#ON[@]} -gt 0 ]]; then
+  for f in "${ON[@]}"; do [[ " ${PAID[*]} " == *" $f "* ]] || die "--with 不认识的功能: ${f}（可选: ${PAID[*]}）"; done
+fi
+status_of() {
+  if [[ ${#ON[@]} -gt 0 && " ${ON[*]} " == *" $1 "* ]]; then echo ENABLED; else echo DISABLED; fi
+}
 
 command -v aws >/dev/null || die "没找到 aws 命令，请先安装 AWS CLI v2"
 gd() { aws --profile "$PROFILE" guardduty "$@"; }
