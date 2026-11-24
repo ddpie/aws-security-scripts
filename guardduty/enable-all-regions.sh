@@ -13,7 +13,7 @@
 #   --delegate <账号ID>     把 GuardDuty 委派给这个账号；已委派给它的区域跳过，委派给别人的区域不覆盖
 #   --features base|default 新建 detector 的保护功能：base=只开基础检测、付费功能全关（默认）；default=AWS 默认
 #   --with <F1,F2>          配合 base：这些付费功能开启，其余仍关闭（如 LAMBDA_NETWORK_LOGS,EKS_AUDIT_LOGS）
-#   --members               在安全账号里：所有组织账号加为成员 + 成员自动启用设为 ALL（付费功能同 --with）
+#   --members               在安全账号里：安全账号自身和所有组织账号的付费功能按 --with 设置，组织账号加为成员，成员自动启用设为 ALL
 #   --admin-profile <名称>  安全账号（委派管理员）的 profile，配合 --members
 #   --regions <a,b,...>     只处理这些区域（默认：所有已启用区域）
 #   --dry-run               只打印要做什么，不做修改
@@ -124,6 +124,13 @@ for R in "${REGIONS[@]}"; do
       n=$(gda list-members --region "$R" --detector-id "$adet" --only-associated false \
         --query 'length(Members)' --output text 2>/dev/null) || n="?"
       line+=" | 现有成员 ${n} 个 → 加入全部 ${#ACC[@]} 个"
+      if [[ $FEATURES == base ]]; then
+        en=$(gda get-detector --region "$R" --detector-id "$adet" \
+          --query "Features[?Status=='ENABLED'].Name" --output text 2>/dev/null) || en="?"
+        paid_on=""; for f in $en; do [[ " ${PAID[*]} " == *" $f "* ]] && paid_on+="${f} "; done
+        paid_on=${paid_on% }; [[ $en == "?" ]] && paid_on="查询失败"
+        line+=" | 安全账号自身付费功能: ${paid_on:-无} → ${WITH:-全关}"
+      fi
     fi
   fi
   echo "$line"
@@ -221,6 +228,22 @@ for R in "${REGIONS[@]}"; do
     if [[ $adet == None || $adet == ERR ]]; then
       echo "  ${R}: 安全账号没有 detector（还没委派？），跳过加成员"; ok=0
     else
+      # 安全账号自己的 detector 是委派时 AWS 自动开的，付费功能可能是默认全开，这里按 --with 统一
+      if [[ $FEATURES == base ]]; then
+        if gda update-detector --region "$R" --detector-id "$adet" --features "${OFF[@]}" >/dev/null 2>"$ERR"; then
+          echo "  ${R}: 安全账号自身付费功能已设为: ${WITH:-全关}"
+        else
+          echo "  ${R}: 安全账号自身功能一次性设置失败，改为逐项设置。原因: $(lasterr)"
+          for f in "${PAID[@]}"; do
+            gda update-detector --region "$R" --detector-id "$adet" --features "$(feat_arg "$f")" >/dev/null 2>"$ERR" && continue
+            if grep -qiE 'not supported|not available|invalid.*feature' "$ERR"; then
+              echo "  ${R}: ${f} 该区域不支持，跳过"
+            else
+              echo "  ${R}: 设置安全账号 ${f} 失败: $(lasterr)"; ok=0
+            fi
+          done
+        fi
+      fi
       if gda update-organization-configuration --region "$R" --detector-id "$adet" \
            --auto-enable-organization-members ALL --features "${OCF[@]}" >/dev/null 2>"$ERR"; then
         echo "  ${R}: 成员自动启用=ALL"
