@@ -5,6 +5,7 @@
 #   ./enable-all-regions.sh --profile <管理账号> --enable                    # 所有区域开通
 #   ./enable-all-regions.sh --profile <管理账号> --delegate 123456789012     # 所有区域委派给安全账号
 #   ./enable-all-regions.sh --profile <管理账号> --enable --delegate 123456789012
+#   ./enable-all-regions.sh --profile <管理账号> --members --admin-profile <安全账号>  # 所有区域把组织所有账号加为成员
 #
 # 参数：
 #   --profile <名称>        AWS CLI profile（必填）
@@ -12,12 +13,14 @@
 #   --delegate <账号ID>     把 GuardDuty 委派给这个账号；已委派给它的区域跳过，委派给别人的区域不覆盖
 #   --features base|default 新建 detector 的保护功能：base=只开基础检测、付费功能全关（默认）；default=AWS 默认
 #   --with <F1,F2>          配合 base：这些付费功能开启，其余仍关闭（如 LAMBDA_NETWORK_LOGS,EKS_AUDIT_LOGS）
+#   --members               在安全账号里：所有组织账号加为成员 + 成员自动启用设为 ALL（付费功能同 --with）
+#   --admin-profile <名称>  安全账号（委派管理员）的 profile，配合 --members
 #   --regions <a,b,...>     只处理这些区域（默认：所有已启用区域）
 #   --dry-run               只打印要做什么，不做修改
 #   --yes                   跳过确认
 set -uo pipefail
 
-PROFILE=""; ENABLE=0; DELEGATE=""; FEATURES=base; WITH=""; ONLY=""; DRY=0; YES=0
+PROFILE=""; ENABLE=0; DELEGATE=""; FEATURES=base; WITH=""; ONLY=""; DRY=0; YES=0; MEMBERS=0; APROFILE=""
 PAID=(S3_DATA_EVENTS EKS_AUDIT_LOGS EBS_MALWARE_PROTECTION RDS_LOGIN_EVENTS LAMBDA_NETWORK_LOGS RUNTIME_MONITORING AI_PROTECTION)
 
 die() { echo "错误: $*" >&2; exit 1; }
@@ -32,12 +35,15 @@ while [[ $# -gt 0 ]]; do
     --regions)  val "$@"; ONLY=$2; shift 2;;
     --dry-run)  DRY=1; shift;;
     --yes)      YES=1; shift;;
-    -h|--help)  sed -n '2,17p' "$0"; exit 0;;
+    --members)  MEMBERS=1; shift;;
+    --admin-profile) val "$@"; APROFILE=$2; shift 2;;
+    -h|--help)  sed -n '2,20p' "$0"; exit 0;;
     *) die "未知参数 $1";;
   esac
 done
 [[ -n $PROFILE ]] || die "缺少 --profile"
-[[ $ENABLE == 1 || -n $DELEGATE ]] || die "至少要用 --enable 或 --delegate 其中一个"
+[[ $ENABLE == 1 || -n $DELEGATE || $MEMBERS == 1 ]] || die "至少要用 --enable、--delegate、--members 其中一个"
+[[ $MEMBERS == 0 || -n $APROFILE ]] || die "--members 需要 --admin-profile <安全账号>"
 [[ -z $DELEGATE || $DELEGATE =~ ^[0-9]{12}$ ]] || die "--delegate 必须是 12 位账号 ID"
 [[ $FEATURES == base || $FEATURES == default ]] || die "--features 只能是 base 或 default"
 IFS=, read -ra ON <<<"${WITH// /}"
@@ -58,6 +64,19 @@ admin_of() {
 }
 ME=$(aws --profile "$PROFILE" sts get-caller-identity --query Account --output text) || die "无法用 profile ${PROFILE} 登录"
 [[ $DELEGATE != "$ME" ]] || die "不能委派给当前账号自己"
+gda() { aws --profile "$APROFILE" guardduty "$@"; }
+ADMIN=""; ACC=()   # ACC: "AccountId=x,Email=y"，组织里除安全账号外的所有 ACTIVE 账号
+if [[ $MEMBERS == 1 ]]; then
+  ADMIN=$(aws --profile "$APROFILE" sts get-caller-identity --query Account --output text) || die "无法用 profile ${APROFILE} 登录"
+  [[ -z $DELEGATE || $DELEGATE == "$ADMIN" ]] || die "--admin-profile 的账号(${ADMIN})和 --delegate(${DELEGATE})不一致"
+  [[ $ADMIN != "$ME" ]] || die "--admin-profile 不能是管理账号自己"
+  LIST=$(aws --profile "$PROFILE" organizations list-accounts \
+    --query "Accounts[?Status=='ACTIVE'].[Id,Email]" --output text) || die "查询组织账号失败（--profile 要用管理账号）"
+  while read -r id em; do
+    [[ -n $id && $id != "$ADMIN" ]] && ACC+=("AccountId=${id},Email=${em}")
+  done <<<"$LIST"
+  [[ ${#ACC[@]} -gt 0 ]] || die "组织里没有可加入的账号"
+fi
 
 if [[ -n $ONLY ]]; then
   IFS=, read -ra REGIONS <<<"${ONLY// /}"
@@ -76,6 +95,7 @@ done
 echo "账号: ${ME}   区域(${#REGIONS[@]}个): ${REGIONS[*]}"
 [[ $ENABLE == 1 ]] && echo "开通: 是（新建 detector 的保护功能: ${FEATURES}${WITH:+，另开 ${WITH}}）"
 [[ -n $DELEGATE ]] && echo "委派给: ${DELEGATE}"
+[[ $MEMBERS == 1 ]] && echo "加成员: 安全账号 ${ADMIN}，组织账号 ${#ACC[@]} 个（成员付费功能: ${WITH:-全关}）"
 echo
 for R in "${REGIONS[@]}"; do
   line="  ${R}:"
@@ -95,6 +115,16 @@ for R in "${REGIONS[@]}"; do
     elif [[ $cur == "$DELEGATE" ]];          then line+=" | 已委派，不动"
     else                                          line+=" | 已委派给 ${cur}，不覆盖"; fi
   fi
+  if [[ $MEMBERS == 1 ]]; then
+    adet=$(gda list-detectors --region "$R" --query 'DetectorIds[0]' --output text 2>/dev/null) || adet=ERR
+    if   [[ $adet == ERR ]];  then line+=" | 安全账号查询失败"
+    elif [[ $adet == None ]]; then line+=" | 安全账号未开通（委派后自动开通）→ 加成员"
+    else
+      n=$(gda list-members --region "$R" --detector-id "$adet" --only-associated false \
+        --query 'length(Members)' --output text 2>/dev/null) || n="?"
+      line+=" | 现有成员 ${n} 个 → 加入全部 ${#ACC[@]} 个"
+    fi
+  fi
   echo "$line"
 done
 echo
@@ -106,6 +136,9 @@ fi
 
 # ---------- 执行 ----------
 OFF=(); for f in "${PAID[@]}"; do OFF+=("Name=${f},Status=$(status_of "$f")"); done
+OCF=(); for f in "${PAID[@]}"; do   # 成员账号的付费功能：--with 里的 ALL，其余 NONE
+  [[ $(status_of "$f") == ENABLED ]] && v=ALL || v=NONE; OCF+=("Name=${f},AutoEnable=${v}")
+done
 FAILED=(); OTHER=()
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 lasterr() { grep -v '^[[:space:]]*$' "$ERR" | tail -n1; }   # AWS CLI 报错末尾有空行
@@ -165,6 +198,52 @@ for R in "${REGIONS[@]}"; do
       echo "  ${R}: 委派给 ${cur} 正在撤销中，稍后重跑"; ok=0
     elif [[ $cur != "$DELEGATE" ]]; then
       OTHER+=("${R}(${cur})")
+    fi
+  fi
+  if [[ $MEMBERS == 1 ]]; then
+    # 刚委派时安全账号的 detector 可能还没建好，等一会
+    adet=None
+    for try in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      adet=$(gda list-detectors --region "$R" --query 'DetectorIds[0]' --output text) || adet=ERR
+      [[ $adet == None ]] || break; sleep 5
+    done
+    if [[ $adet == None || $adet == ERR ]]; then
+      echo "  ${R}: 安全账号没有 detector（还没委派？），跳过加成员"; ok=0
+    else
+      if gda update-organization-configuration --region "$R" --detector-id "$adet" \
+           --auto-enable-organization-members ALL --features "${OCF[@]}" >/dev/null 2>"$ERR"; then
+        echo "  ${R}: 成员自动启用=ALL"
+      else
+        # 多半是该区域不支持某项功能：先只设 ALL，再逐项设置
+        echo "  ${R}: 一次性设置失败，改为逐项设置。原因: $(lasterr)"
+        if gda update-organization-configuration --region "$R" --detector-id "$adet" \
+             --auto-enable-organization-members ALL >/dev/null; then
+          echo "  ${R}: 成员自动启用=ALL"
+          for x in "${OCF[@]}"; do
+            gda update-organization-configuration --region "$R" --detector-id "$adet" \
+              --auto-enable-organization-members ALL --features "$x" >/dev/null 2>"$ERR" && continue
+            if grep -qiE 'not supported|not available|invalid.*feature' "$ERR"; then
+              echo "  ${R}: ${x%%,*} 该区域不支持，跳过"
+            else
+              echo "  ${R}: 设置成员功能 ${x} 失败: $(lasterr)"; ok=0
+            fi
+          done
+        else
+          echo "  ${R}: 设置成员自动启用失败"; ok=0
+        fi
+      fi
+      # create-members 每次最多 50 个；已是成员的账号会被跳过，不算失败
+      bad=0; i=0
+      while [[ $i -lt ${#ACC[@]} ]]; do
+        un=$(gda create-members --region "$R" --detector-id "$adet" --account-details "${ACC[@]:$i:50}" \
+          --query 'UnprocessedAccounts[].[AccountId,Result]' --output text 2>"$ERR") || { echo "  ${R}: 加成员失败: $(lasterr)"; bad=1; }
+        while IFS= read -r l; do
+          [[ -z $l ]] && continue
+          echo "$l" | grep -qi 'already' || { echo "  ${R}: 账号未加入: ${l}"; bad=1; }
+        done <<<"$un"
+        i=$((i + 50))
+      done
+      if [[ $bad == 0 ]]; then echo "  ${R}: 已加入 ${#ACC[@]} 个组织账号"; else ok=0; fi
     fi
   fi
   [[ $ok == 1 ]] || FAILED+=("$R")
