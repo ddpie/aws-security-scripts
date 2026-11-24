@@ -49,7 +49,8 @@ done
 IFS=, read -ra ON <<<"${WITH// /}"
 [[ ${#ON[@]} -eq 0 || $FEATURES == base ]] || die "--with 只能配合 --features base"
 if [[ ${#ON[@]} -gt 0 ]]; then
-  for f in "${ON[@]}"; do [[ " ${PAID[*]} " == *" $f "* ]] || die "--with 不认识的功能: ${f}（可选: ${PAID[*]}）"; done
+  for f in "${ON[@]}"; do [[ " ${PAID[*]} RDS_DATA_RISK " == *" $f "* ]] || die "--with 不认识的功能: ${f}（可选: ${PAID[*]} RDS_DATA_RISK）"; done
+  [[ " ${ON[*]} " != *" RDS_DATA_RISK "* || " ${ON[*]} " == *" RDS_LOGIN_EVENTS "* ]] || die "RDS_DATA_RISK 要和 RDS_LOGIN_EVENTS 一起开"
 fi
 status_of() {
   if [[ ${#ON[@]} -gt 0 && " ${ON[*]} " == *" $1 "* ]]; then echo ENABLED; else echo DISABLED; fi
@@ -135,10 +136,20 @@ if [[ $YES == 0 ]]; then
 fi
 
 # ---------- 执行 ----------
-OFF=(); for f in "${PAID[@]}"; do OFF+=("Name=${f},Status=$(status_of "$f")"); done
-OCF=(); for f in "${PAID[@]}"; do   # 成员账号的付费功能：--with 里的 ALL，其余 NONE
-  [[ $(status_of "$f") == ENABLED ]] && v=ALL || v=NONE; OCF+=("Name=${f},AutoEnable=${v}")
-done
+# RDS 数据活动监控(RDS_DATA_RISK)是 RDS_LOGIN_EVENTS 的子配置，登录监控开着时明确设置它
+feat_arg() {   # detector 用：Name=..,Status=..
+  local a="Name=${1},Status=$(status_of "$1")"
+  [[ $1 == RDS_LOGIN_EVENTS && $(status_of "$1") == ENABLED ]] && a+=",AdditionalConfiguration=[{Name=RDS_DATA_RISK,Status=$(status_of RDS_DATA_RISK)}]"
+  echo "$a"
+}
+auto_of() { [[ $(status_of "$1") == ENABLED ]] && echo ALL || echo NONE; }
+org_arg() {    # 组织配置用：--with 里的 ALL，其余 NONE
+  local a="Name=${1},AutoEnable=$(auto_of "$1")"
+  [[ $1 == RDS_LOGIN_EVENTS && $(status_of "$1") == ENABLED ]] && a+=",AdditionalConfiguration=[{Name=RDS_DATA_RISK,AutoEnable=$(auto_of RDS_DATA_RISK)}]"
+  echo "$a"
+}
+OFF=(); OCF=()
+for f in "${PAID[@]}"; do OFF+=("$(feat_arg "$f")"); OCF+=("$(org_arg "$f")"); done
 FAILED=(); OTHER=()
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 lasterr() { grep -v '^[[:space:]]*$' "$ERR" | tail -n1; }   # AWS CLI 报错末尾有空行
@@ -159,7 +170,7 @@ for R in "${REGIONS[@]}"; do
             done_f=0
             for try in 1 2 3; do
               gd update-detector --region "$R" --detector-id "$det" \
-                --features "Name=${f},Status=$(status_of "$f")" >/dev/null 2>"$ERR" && { done_f=1; break; }
+                --features "$(feat_arg "$f")" >/dev/null 2>"$ERR" && { done_f=1; break; }
               sleep 5
             done
             if [[ $done_f == 0 ]]; then
